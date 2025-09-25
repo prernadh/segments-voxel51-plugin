@@ -55,6 +55,10 @@ class UploadLabelType(str, enum.Enum):
     DETECTION_3D = "3d-detection"
     POLYLINES_3D = "3d-polylines"
     POLYLINE_3D = "3d-polyline"
+    DETECTIONS_3D_SEQUENCE = "3d-detections-sequence"
+    DETECTION_3D_SEQUENCE = "3d-detection-sequence"
+    POLYLINES_3D_SEQUENCE = "3d-polylines-sequence"
+    POLYLINE_3D_SEQUENCE = "3d-polyline-sequence"
 
 
 POINTCLOUD_TASKS = {
@@ -227,7 +231,7 @@ class RequestAnnotations(foo.Operator):
             view=data_choices,
         )
 
-    def get_labels_list(self, ctx, inputs):
+    def get_labels_list(self, ctx, inputs, label_field_name, label_field_title, description="Select the label field to upload to Segments.ai"):
         dataset_view = self.target_dataset_view(ctx)
         label_fields = dataset_view.get_field_schema(embedded_doc_type = fo.Label)
         
@@ -236,11 +240,11 @@ class RequestAnnotations(foo.Operator):
             label_choices.add_choice(field, label=field)
 
         inputs.enum(
-            "label_field",
+            label_field_name,
             label_choices.values(),
-            label="Label field to upload",
+            label=label_field_title,
             view=label_choices,
-            description="Select the label field to upload to Segments.ai",
+            description=description,
         )
 
     
@@ -262,8 +266,18 @@ class RequestAnnotations(foo.Operator):
             raise ValueError(f"Unsupported label type for upload: {self.upload_label_type}")
         return all_pts
     
-    def _fetch_fo_label_points_3d(self, single_label, track_id, cat_map):
-        if self.upload_label_type in (UploadLabelType.DETECTION_3D, UploadLabelType.DETECTIONS_3D):
+    def _fetch_fo_label_points_3d(self, single_label, track_id, cat_map, instance_map):
+        if self.upload_label_type in (UploadLabelType.DETECTION_3D, UploadLabelType.DETECTIONS_3D, UploadLabelType.DETECTION_3D_SEQUENCE, UploadLabelType.DETECTIONS_3D_SEQUENCE):
+            update_track_id = True
+            instance = single_label.instance
+            if instance is not None:
+                instance_id = instance.id
+                if instance_id in instance_map:
+                    update_track_id = False
+                    track_id = instance_map[instance_id]
+                else:
+                    update_track_id = True
+                    instance_map[instance_id] = track_id
             location = single_label.location
             dimensions = single_label.dimensions
             rotation_euler = single_label.rotation
@@ -292,9 +306,20 @@ class RequestAnnotations(foo.Operator):
                     "qw": qw
                 }
             }]
-            track_id += 1
-        elif self.upload_label_type in (UploadLabelType.POLYLINES_3D, UploadLabelType.POLYLINE_3D):
+            if update_track_id:
+                track_id += 1
+        elif self.upload_label_type in (UploadLabelType.POLYLINES_3D, UploadLabelType.POLYLINE_3D, UploadLabelType.POLYLINES_3D_SEQUENCE, UploadLabelType.POLYLINE_3D_SEQUENCE):
             anno = []
+            update_track_id = True
+            instance = single_label.instance
+            if instance is not None:
+                instance_id = instance.id
+                if instance_id in instance_map:
+                    update_track_id = False
+                    track_id = instance_map[instance_id]
+                else:
+                    update_track_id = True
+                    instance_map[instance_id] = track_id
             for pt_list in single_label.points3d:
                 pts = [pt for pt in pt_list]
                 anno_single = {
@@ -304,15 +329,16 @@ class RequestAnnotations(foo.Operator):
                     "type": "polyline",
                     "points": pts
                 }
-                track_id += 1
+                if update_track_id:
+                    track_id += 1
                 anno.append(anno_single)
-        return anno, track_id
+        return anno, track_id, instance_map
 
     def _fetch_fo_label_iterable(self, sample, label_field_name):
         if sample[label_field_name] is not None:
-            if self.upload_label_type in (UploadLabelType.DETECTIONS, UploadLabelType.DETECTIONS_3D):
+            if self.upload_label_type in (UploadLabelType.DETECTIONS, UploadLabelType.DETECTIONS_3D, UploadLabelType.DETECTIONS_3D_SEQUENCE):
                 return sample[label_field_name].detections
-            elif self.upload_label_type in (UploadLabelType.POLYLINES, UploadLabelType.POLYLINES_3D):
+            elif self.upload_label_type in (UploadLabelType.POLYLINES, UploadLabelType.POLYLINES_3D, UploadLabelType.POLYLINES_3D_SEQUENCE):
                 return sample[label_field_name].polylines
             else:
                 return [sample[label_field_name]]
@@ -322,45 +348,88 @@ class RequestAnnotations(foo.Operator):
     def upload_selected_label_field(self, client, ctx, dataset_view, task_type):
         cat_map = self.cat_map
         label_field_name = ctx.params["label_field"]
-        for sample in dataset_view:
-            label_list = self._fetch_fo_label_iterable(sample, label_field_name)
-            if label_list is None:
-                continue
-            if "3d" not in self.upload_label_type:
-                width = sample.metadata.width
-                height = sample.metadata.height
-                annotations = []
-                det_idx = 0
-                for single_label in label_list:
-                    if single_label.label not in cat_map:
-                        continue
-                    points = self._fetch_fo_label_points(single_label, width, height)
-                    segments_task_type = task_type.value
-                    if getattr(single_label, "filled",  False):
-                            segments_task_type += "-filled"
-                    for pts in points:
-                        anno = {"track_id": det_idx + 1, 
-                                "id": det_idx + 1,  #this is a legacy field and is always equal to track_id.
-                                "category_id": cat_map[single_label.label], # the category id
-                                "type": _ANNO_LABEL_MAP[segments_task_type], # refers to the annotation type (bounding box)
-                                "points": pts}
-                        annotations.append(anno)
-                        det_idx += 1
-                if len(annotations) > 0:
-                    client.add_label(sample.segments_uuid, "ground-truth", {'format_version': '0.1', 'annotations': annotations})
-            else:
-                det_idx = 0
-                annotations = []
-                for single_label in label_list:
-                    if single_label.label not in cat_map:
-                        continue
-                    anno, det_idx = self._fetch_fo_label_points_3d(single_label, det_idx + 1, cat_map)
-                    annotations.extend(anno)
-                if len(annotations) > 0:
-                    if "detection" in self.upload_label_type:
-                        client.add_label(sample.segments_uuid, "ground-truth", {'format_version': '0.2', 'annotations': annotations})
-                    elif "polyline" in self.upload_label_type:
+        if "sequence" not in self.upload_label_type:
+            for sample in dataset_view:
+                label_list = self._fetch_fo_label_iterable(sample, label_field_name)
+                if label_list is None:
+                    continue
+                
+                if "3d" not in self.upload_label_type:
+                    width = sample.metadata.width
+                    height = sample.metadata.height
+                    annotations = []
+                    det_idx = 0
+
+                    for single_label in label_list:
+                        if single_label.label not in cat_map:
+                            continue
+
+                        points = self._fetch_fo_label_points(single_label, width, height)
+                        segments_task_type = task_type.value
+                        if getattr(single_label, "filled",  False):
+                                segments_task_type += "-filled"
+                                
+                        for pts in points:
+                            anno = {"track_id": det_idx + 1, 
+                                    "id": det_idx + 1,  #this is a legacy field and is always equal to track_id.
+                                    "category_id": cat_map[single_label.label], # the category id
+                                    "type": _ANNO_LABEL_MAP[segments_task_type], # refers to the annotation type (bounding box)
+                                    "points": pts}
+                            annotations.append(anno)
+                            det_idx += 1
+
+                    if len(annotations) > 0:
                         client.add_label(sample.segments_uuid, "ground-truth", {'format_version': '0.1', 'annotations': annotations})
+                else:
+                    det_idx = 0
+                    instance_map = {}
+                    annotations = []
+
+                    for single_label in label_list:
+                        if single_label.label not in cat_map:
+                            continue
+
+                        anno, det_idx, instance_map = self._fetch_fo_label_points_3d(single_label, det_idx + 1, cat_map, instance_map)
+                        annotations.extend(anno)
+
+                    if len(annotations) > 0:
+                        if "detection" in self.upload_label_type:
+                            client.add_label(sample.segments_uuid, "ground-truth", {'format_version': '0.2', 'annotations': annotations})
+                        elif "polyline" in self.upload_label_type:
+                            client.add_label(sample.segments_uuid, "ground-truth", {'format_version': '0.1', 'annotations': annotations})
+        else:
+            point_cloud_name = None
+            for dynamic_group in dataset_view.iter_dynamic_groups():
+                frames = []
+                for group in dynamic_group.iter_groups():
+                    if point_cloud_name is None:
+                        for sensor_name, sensor_sample in group.items():
+                            if sensor_sample.media_type == "point-cloud":
+                                break
+                        point_cloud_name = sensor_name
+
+                    sample = group[point_cloud_name]
+                    label_list = self._fetch_fo_label_iterable(sample, label_field_name)
+                    if label_list is None:
+                        continue
+
+                    det_idx = 0
+                    instance_map = {}
+                    annotations = []
+
+                    for single_label in label_list:
+                        if single_label.label not in cat_map:
+                            continue
+
+                        anno, det_idx, instance_map = self._fetch_fo_label_points_3d(single_label, det_idx + 1, cat_map, instance_map)
+                        annotations.extend(anno)
+
+                    point_cloud_sequence = segments.typing.PointcloudSequenceCuboidFrame(annotations=annotations,format_version="0.2")
+                    frames.append(point_cloud_sequence)
+
+                point_cloud_sequence_scene = segments.typing.PointcloudSequenceCuboidLabelAttributes(frames=frames,format_version="0.2")
+                # assume all samples in the scene share the same segments_uuid
+                client.add_label(sample.segments_uuid, "ground-truth", point_cloud_sequence_scene)
 
     def _check_types_get_upload_label_type(self, dataset_view, label_field_name, task_type):
         if task_type in (SegmentsDatasetType.BBOXES.value, SegmentsDatasetType.POINTCLOUD_CUBOID.value):
@@ -389,6 +458,37 @@ class RequestAnnotations(foo.Operator):
                 raise ValueError(
                     f"Label field '{label_field_name}' is not a valid Polylines field"
                 )
+        elif task_type == SegmentsDatasetType.POINTCLOUD_CUBOID_SEQUENCE.value:
+            if label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Detections):
+                self.upload_label_type  = UploadLabelType.DETECTIONS_3D_SEQUENCE
+            elif label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Detection):
+                self.upload_label_type = UploadLabelType.DETECTION_3D_SEQUENCE
+            else:
+                raise ValueError(
+                    f"Label field '{label_field_name}' is not a valid Detections field"
+                )
+        elif task_type == SegmentsDatasetType.POINTCLOUD_VECTOR_SEQUENCE.value:
+            if label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Polylines):
+                self.upload_label_type  = UploadLabelType.POLYLINES_3D_SEQUENCE
+            elif label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Polyline):
+                self.upload_label_type = UploadLabelType.POLYLINE_3D_SEQUENCE
+            else:
+                raise ValueError(
+                    f"Label field '{label_field_name}' is not a valid Polylines field"
+                )
+            # elif task_type == SegmentsDatasetType.MULTISENSOR_SEQUENCE.value:
+            #     if label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Detections):
+            #         self.upload_label_type  = UploadLabelType.DETECTIONS_3D_SEQUENCE
+            #     elif label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Detection):
+            #         self.upload_label_type = UploadLabelType.DETECTION_3D_SEQUENCE
+            #     elif label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Polylines):
+            #         self.upload_label_type  = UploadLabelType.POLYLINES_3D_SEQUENCE
+            #     elif label_field_name in dataset_view.get_field_schema(embedded_doc_type=fo.Polyline):
+            #         self.upload_label_type = UploadLabelType.POLYLINE_3D_SEQUENCE
+            #     else:
+            #         raise ValueError(
+            #             f"Only Detections or Polylines fields are supported for multisensor sequences. '{label_field_name}' is not one of these."
+            #         )
         else:
             raise ValueError(
                 f"Upload of labels of type {task_type} not supported through the plugin"
@@ -398,6 +498,7 @@ class RequestAnnotations(foo.Operator):
         data_upload_target = DatasetUploadTarget(ctx.params["dataset_choice"])
         dataset_view = self.target_dataset_view(ctx)
         label_field_name = ctx.params.get("label_field", None)
+        # cam_label_field_name = ctx.params.get("label_field_cam", None)
 
         client = get_client(ctx)
         if data_upload_target == DatasetUploadTarget.NEW:
@@ -406,8 +507,12 @@ class RequestAnnotations(foo.Operator):
             if label_field_name is not None:
                 self._check_types_get_upload_label_type(dataset_view, label_field_name, task_type)
                 if ctx.params["classes"] == []:
-                    _, label_path = dataset_view._get_label_field_path(label_field_name, "label")
-                    label_classes = sorted(set(dataset_view._dataset.distinct(label_path)) | set(dataset_view.distinct(label_path)))
+                    if dataset_view.media_type == "group":
+                        _, label_path = dataset_view.select_group_slices(_allow_mixed=True)._get_label_field_path(label_field_name, "label")
+                        label_classes = sorted(set(dataset_view._dataset.select_group_slices(_allow_mixed=True).distinct(label_path)) | set(dataset_view.select_group_slices(_allow_mixed=True).distinct(label_path)))
+                    else:
+                        _, label_path = dataset_view._get_label_field_path(label_field_name, "label")
+                        label_classes = sorted(set(dataset_view._dataset.distinct(label_path)) | set(dataset_view.distinct(label_path)))
             cat_map={}
             attributes = {"format_version": "0.1", "categories": []}
             for idx, cls in enumerate(label_classes):
@@ -498,7 +603,7 @@ class RequestAnnotations(foo.Operator):
             self.dataset_type_selector(
                 ctx, inputs, ctx.dataset.media_type, is_sequence
             )
-            self.get_labels_list(ctx, inputs)
+            self.get_labels_list(ctx, inputs, "label_field", "[Optional] Label field to upload")
 
             inputs.list(
                 "classes",
@@ -520,8 +625,12 @@ class RequestAnnotations(foo.Operator):
                 description="This will add cameras as annotation tasks in the multisensor interface",
                 views=types.CheckboxView(),
             )
+            # if ctx.params.get("add_image_sensors", False):
+            #     self.get_labels_list(ctx, inputs, "label_field_cam", "[Optional] Camera label field to upload", description="Select the label field to upload to Segments.ai for the camera sensors.")
+
         if ctx.params.get("target", ""):
             dataset_view = self.target_dataset_view(ctx)
+            # cam_label_field_name = ctx.params.get("label_field_cam", None)
             if label_field_name is not None:
                 if dataset_type in (SegmentsDatasetType.BBOXES.value, SegmentsDatasetType.VECTOR.value, SegmentsDatasetType.KEYPOINTS.value):
                     if None in dataset_view.values("metadata"):
@@ -529,6 +638,13 @@ class RequestAnnotations(foo.Operator):
                             label="Some samples do not have metadata. Please compute metadata for all samples before uploading."
                         )
                         inputs.view("warning_no_metadata", error_metadata, invalid=True)
+            # if cam_label_field_name is not None:
+            #     metadata = dataset_view.select_group_slices(media_type="image").values("metadata")
+            #     if None in metadata:
+            #         error_metadata = types.Error(
+            #             label="Some camera samples do not have metadata. Please compute metadata for all camera samples before uploading."
+            #         )
+            #         inputs.view("warning_no_metadata_camera", error_metadata, invalid=True)
 
         sequence_tasks_str = set(map(lambda x: x.value, SEQUENCE_TASKS))
         if dataset_type in sequence_tasks_str:
@@ -1219,9 +1335,16 @@ def upload_dataset(
                 s.set_values("segments_frame_idx", range(len(s)))
                 s.set_values("segments_sensor_name", [groupname] * len(s))
         elif task_type in SEQUENCE_TASKS:
-            s.set_values("segments_uuid", [segments_sample.uuid] * len(s))
-            s.set_values("segments_frame_idx", range(len(s)))
-            s.set_values("segments_sensor_name", ["sample"] * len(s))
+            if dataset.media_type == "group":
+                for groupname in s.group_slices:
+                    s.group_slice = groupname
+                    s.set_values("segments_uuid", [segments_sample.uuid] * len(s))
+                    s.set_values("segments_frame_idx", range(len(s)))
+                    s.set_values("segments_sensor_name", [groupname] * len(s))
+            else:
+                s.set_values("segments_uuid", [segments_sample.uuid] * len(s))
+                s.set_values("segments_frame_idx", range(len(s)))
+                s.set_values("segments_sensor_name", ["sample"] * len(s))
         else:
             s["segments_uuid"] = segments_sample.uuid
             s.save()
@@ -1399,20 +1522,24 @@ def _generate_attrib_frames_lidar_group(
                 "url": asset_info[sensor_name].url,
             }
             if sensor_sample.metadata is not None:
-                if sensor_sample.metadata.intrinsic_matrix is not None:
+                intrinsic_matrix = sensor_sample.metadata.intrinsic_matrix if hasattr(sensor_sample.metadata, 'intrinsic_matrix') else None
+                if intrinsic_matrix is not None:
                     image_info["intrinsics"] = {
-                        "intrinsic_matrix": sensor_sample.metadata.intrinsic_matrix
+                        "intrinsic_matrix": intrinsic_matrix
                     }
 
-                if sensor_sample.metadata.extrinsics_translation is not None:
+                extrinsics_translation = sensor_sample.metadata.extrinsics_translation if hasattr(sensor_sample.metadata, 'extrinsics_translation') else None
+                extrinsics_rotation = sensor_sample.metadata.extrinsics_rotation if hasattr(sensor_sample.metadata, 'extrinsics_rotation') else None
+                if extrinsics_translation is not None:
                     image_info["extrinsics"] = {
-                        "translation": sensor_sample.metadata.extrinsics_translation,
-                        "rotation": sensor_sample.metadata.extrinsics_rotation,
+                        "translation": extrinsics_translation,
+                        "rotation": extrinsics_rotation,
                     }
 
-                if sensor_sample.metadata.camera_convention is not None:
+                camera_convention = sensor_sample.metadata.camera_convention if hasattr(sensor_sample.metadata, 'camera_convention') else None
+                if camera_convention is not None:
                     image_info["camera_convention"] = (
-                        sensor_sample.metadata.camera_convention
+                        camera_convention
                     )
 
             images.append(image_info)
