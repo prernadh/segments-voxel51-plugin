@@ -266,7 +266,7 @@ class RequestAnnotations(foo.Operator):
             raise ValueError(f"Unsupported label type for upload: {self.upload_label_type}")
         return all_pts
     
-    def _fetch_fo_label_points_3d(self, single_label, track_id, cat_map, instance_map):
+    def _fetch_fo_label_points_3d(self, single_label, track_id, cat_map, instance_map, is_keyframe=False):
         if self.upload_label_type in (UploadLabelType.DETECTION_3D, UploadLabelType.DETECTIONS_3D, UploadLabelType.DETECTION_3D_SEQUENCE, UploadLabelType.DETECTIONS_3D_SEQUENCE):
             update_track_id = True
             instance = single_label.instance
@@ -306,6 +306,8 @@ class RequestAnnotations(foo.Operator):
                     "qw": qw
                 }
             }]
+            if is_keyframe:
+                anno[0]["is_keyframe"] = True
             if update_track_id:
                 track_id += 1
         elif self.upload_label_type in (UploadLabelType.POLYLINES_3D, UploadLabelType.POLYLINE_3D, UploadLabelType.POLYLINES_3D_SEQUENCE, UploadLabelType.POLYLINE_3D_SEQUENCE):
@@ -421,7 +423,7 @@ class RequestAnnotations(foo.Operator):
                         if single_label.label not in cat_map:
                             continue
 
-                        anno, det_idx, instance_map = self._fetch_fo_label_points_3d(single_label, det_idx + 1, cat_map, instance_map)
+                        anno, det_idx, instance_map = self._fetch_fo_label_points_3d(single_label, det_idx + 1, cat_map, instance_map, is_keyframe=True)
                         annotations.extend(anno)
 
                     point_cloud_sequence = segments.typing.PointcloudSequenceCuboidFrame(annotations=annotations,format_version="0.2")
@@ -429,6 +431,7 @@ class RequestAnnotations(foo.Operator):
 
                 point_cloud_sequence_scene = segments.typing.PointcloudSequenceCuboidLabelAttributes(frames=frames,format_version="0.2")
                 # assume all samples in the scene share the same segments_uuid
+                breakpoint()
                 client.add_label(sample.segments_uuid, "ground-truth", point_cloud_sequence_scene)
 
     def _check_types_get_upload_label_type(self, dataset_view, label_field_name, task_type):
